@@ -285,12 +285,7 @@ sh nginx2root_audit.sh --self-test     # 通过 21 项, 失败 0 项
 
 | 文件 | 定位 |
 |---|---|
-| `nginx2root_audit.sh` | **本脚本**：统一审计，合并了另外两个脚本的检测方法，POSIX `sh` 单文件、可独立下发、内置自检、完整报告 |
-| `nginx2root-check.sh` | 早期 POSIX `sh` 检测脚本（`nginx -T/-V`、Docker 镜像、发行版提示），其方法已并入本脚本 |
-| `check_nginx2root.sh` | 早期 bash 检测脚本（配置证据、门控判定、彩色表格、CVE/QVD 映射），其方法已并入本脚本 |
-| `phpsrc/21_vuln/index.php` | 项目内的 HTTP 检测 case（`nginx2root` 及 5 个 `cve_2026_*` action），供 Web 页面/一键测试使用 |
-| `phpsrc/scan/index.php` | 一键测试注册表 |
-| `html/version.json`、`CHANGELOG.md` | 版本台账 |
+
 
 > 本脚本与项目内 PHP case 是两条独立路径：前者用于**下发到各系统离线巡检**，后者用于**测试站点在线验证**。
 
