@@ -182,15 +182,27 @@ add_note() { NOTES="${NOTES:+$NOTES|}$1"; }
 # 宽正则: 用于从配置文件预筛出所有相关行, 供证据复用
 WIDE_RE='http2|http3|quic|resolver|proxy_pass|grpc_pass|mirror|auth_http|mail|ssl_preread|alias|try_files|proxy[[:space:]]+on'
 
+# 在「文件:行号:内容」格式的配置行中按内容匹配（剥离前缀后再套用带 ^ 锚定的正则），
+# 输出仍保留原始的 文件:行号:内容 行。用环境变量传正则，避免 awk -v 对 \$ 等转义的二次解释。
+scan_config_rows() {
+    printf '%s\n' "$2" | N2R_PAT="$1" awk '
+        BEGIN { pat = ENVIRON["N2R_PAT"] }
+        {
+            body = $0
+            sub(/^[^:]*:[0-9]*:/, "", body)
+            if (body ~ pat) print $0
+        }'
+}
+
 # 证据: 优先配置文件(真实文件名:行号), 其次 nginx -T 索引行
 evid() {
     _ep=$1
     if [ -n "$CFG_EVID" ]; then
-        printf '%s\n' "$CFG_EVID" | grep -Ei "$_ep" | head -2
+        scan_config_rows "$_ep" "$CFG_EVID" | head -2
     elif [ -n "$CFG_INDEXED" ]; then
-        printf '%s\n' "$CFG_INDEXED" | grep -Ei "$_ep" | head -2
+        scan_config_rows "$_ep" "$CFG_INDEXED" | head -2
     else
-        echo ""
+        printf '%s\n' "$CFG_DUMP" | grep -Ein "$_ep" | head -2 | sed 's/^/nginx.conf:/'
     fi
 }
 
@@ -437,6 +449,29 @@ for_each_case() {
                 *)        N_NOEXPOSED=$(( N_NOEXPOSED + 1 )) ;;
             esac
             ;;
+        files)
+            # 收集「有问题的配置文件」原始行: 文件|CVE|判定|行号|内容
+            # 仅统计 AFFECTED / REVIEW 的 case；重新扫描全部配置证据，不受逐项详情 head -2 限制
+            if [ "$CV_VERDICT" = "AFFECTED" ] || [ "$CV_VERDICT" = "REVIEW" ]; then
+                for _fc in $_reqs; do
+                    _fpat=$(cond_pattern "$_fc")
+                    if [ -n "$CFG_EVID" ]; then
+                        scan_config_rows "$_fpat" "$CFG_EVID"
+                    elif [ -n "$CFG_INDEXED" ]; then
+                        scan_config_rows "$_fpat" "$CFG_INDEXED"
+                    else
+                        printf '%s\n' "$CFG_DUMP" | grep -Ein "$_fpat" | sed 's/^/nginx.conf:/'
+                    fi
+                done | while IFS= read -r _ev; do
+                    [ -z "$_ev" ] && continue
+                    _pf=${_ev%%:*}
+                    _prest=${_ev#*:}
+                    _pln=${_prest%%:*}
+                    _ptxt=${_prest#*:}
+                    printf '%s|%s|%s|%s|%s\n' "$_pf" "$_cve" "$CV_VERDICT" "$_pln" "$_ptxt"
+                done
+            fi
+            ;;
         esac
     done <<EOF_CASES
 $CASES
@@ -534,6 +569,26 @@ if [ "$VER_STATUS" = "vulnerable" ] && [ "$N_AFFECTED" -eq 0 ] && [ "$N_REVIEW" 
     add_note "版本受影响但未见触发配置: 仍建议升级, 并确认所读配置即为当前运行中的配置"
 fi
 
+# ---------- 有问题的配置文件聚合 ----------
+# PROBLEM_ROWS 每行: 文件|CVE|判定|行号|内容；仅包含 AFFECTED / REVIEW 的命中行
+PROBLEM_ROWS=$(for_each_case files)
+PROBLEM_FILES=$(printf '%s\n' "$PROBLEM_ROWS" | awk -F'|' '
+    NF < 4 { next }
+    {
+        f=$1; c=$2; v=$3; ln=$4
+        key=f SUBSEP ln
+        if (!(f in seen)) { seen[f]=1; order[++n]=f }
+        if (!(key in lineSeen)) { lineSeen[key]=1; cnt[f]++ }   # 同一 文件:行号 只计一次
+        if (index(cves[f], c) == 0) cves[f] = cves[f] (cves[f] ? ", " : "") c
+        if (index(vs[f], v) == 0)   vs[f]   = vs[f]   (vs[f] ? ", " : "") v
+    }
+    END { for (i=1; i<=n; i++) { f=order[i]; printf "%s|%d|%s|%s\n", f, cnt[f], cves[f], vs[f] } }' \
+    | sort -t'|' -k2,2nr -k1,1)
+PROBLEM_FILE_COUNT=0
+if [ -n "$PROBLEM_FILES" ]; then
+    PROBLEM_FILE_COUNT=$(printf '%s\n' "$PROBLEM_FILES" | grep -c .)
+fi
+
 # 退出码: 1 受影响 / 2 需关注 / 0 安全
 EXIT_CODE=0
 if [ "$N_AFFECTED" -gt 0 ]; then
@@ -576,14 +631,68 @@ emit_json() {
         "$(yesno $EN_ALIAS | sed 's/yes/true/;s/no/false/')" \
         "$(yesno $EN_TRYFILES | sed 's/yes/true/;s/no/false/')"
     for_each_case json
-    printf ',"summary":{"total":5,"affected":%d,"review":%d,"not_exposed":%d,"safe":%d,"risk_cves":%s,"exit_code":%d},' \
-        "$N_AFFECTED" "$N_REVIEW" "$N_NOEXPOSED" "$N_SAFE" "$(json_str "$RISK_LIST")" "$EXIT_CODE"
+    # 有问题的配置文件（去重清单 + 每个文件的命中证据）
+    printf ',"affected_files":['
+    printf '%s\n' "$PROBLEM_FILES" | {
+        _af_first=1
+        while IFS='|' read -r _af _acnt _acves _avs; do
+            [ -z "$_af" ] && continue
+            [ "$_af_first" = 1 ] || printf ','
+            _af_first=0
+            printf '{"file":%s,"hit_lines":%s,"cves":%s,"verdicts":%s,"evidence":[' \
+                "$(json_str "$_af")" "$_acnt" "$(json_str "$_acves")" "$(json_str "$_avs")"
+            printf '%s\n' "$PROBLEM_ROWS" | awk -F'|' -v f="$_af" '
+                $1==f && n<6 {
+                    if (($4) in lnSeen) next
+                    lnSeen[$4]=1
+                    l=$0; sub(/^[^|]*\|[^|]*\|[^|]*\|[^|]*\|/, "", l);
+                    gsub(/\\/, "\\\\", l); gsub(/"/, "\\\"", l);
+                    gsub(/\r/, "", l); gsub(/\t/, " ", l);
+                    printf "%s\"%s:%s\"", (n++ ? "," : ""), $4, l
+                }'
+            printf ']}'
+        done
+    }
+    printf ']'
+    printf ',"summary":{"total":5,"affected":%d,"review":%d,"not_exposed":%d,"safe":%d,"risk_cves":%s,"affected_files":%d,"exit_code":%d},' \
+        "$N_AFFECTED" "$N_REVIEW" "$N_NOEXPOSED" "$N_SAFE" "$(json_str "$RISK_LIST")" "$PROBLEM_FILE_COUNT" "$EXIT_CODE"
     printf '"notes":['
     _jf=1; _jifs=$IFS; IFS='|'
     for _jn in $NOTES; do [ "$_jf" = 1 ] || printf ','; json_str "$_jn"; _jf=0; done
     IFS=$_jifs
     printf '],"remediation":{"upgrade":"1.30.7 stable / 1.31.9 mainline, restart required (reload keeps old binary)","mitigation":"http2 off only covers CVE-2026-123007 and CVE-2026-123633","references":["F5 K000164058 / K000163926","CERT-EU 2026-022","nginx.org security advisories","Xint NGINX2Root writeup"]},"limitations":["read-only static assessment, no attack traffic sent","config conditions matched globally; confirm same server/location block","distro backports may make X.Y.Z misleading","WAF rules cannot block HTTP/2 control-frame attacks"]'
     printf '}\n'
+}
+
+emit_problem_files() {
+    echo "  ${B}[8] 有问题的配置文件${NC}"
+    echo "$SUB"
+    if [ -z "$PROBLEM_ROWS" ]; then
+        if [ -z "$CFG_DUMP" ]; then
+            echo "   未能取得配置文本，无法列出配置文件（请检查权限或 --conf-dir）"
+        else
+            echo "   无（当前未发现触发条件齐全的漏洞路径）"
+        fi
+        echo "   ${DIM}说明: 仅列出判定为 AFFECTED / REVIEW 的 CVE 所命中的配置文件${NC}"
+        return
+    fi
+    printf "   共 %s 个配置文件命中触发条件（按命中行数降序）\n\n" "$PROBLEM_FILE_COUNT"
+    printf '%s\n' "$PROBLEM_FILES" | while IFS='|' read -r _f _cnt _cves _vs; do
+        [ -z "$_f" ] && continue
+        printf "   ${B}● %s${NC}\n" "$_f"
+        printf "     命中行: %s   关联: %s   判定: %s\n" "$_cnt" "$_cves" "$_vs"
+        printf '%s\n' "$PROBLEM_ROWS" | awk -F'|' -v f="$_f" '
+            $1==f && n<6 {
+                if (($4) in lnSeen) next
+                lnSeen[$4]=1
+                l=$0; sub(/^[^|]*\|[^|]*\|[^|]*\|[^|]*\|/, "", l);
+                gsub(/\r/, "", l); gsub(/\t/, " ", l);
+                printf "       %s:%s\n", $4, l
+                n++
+            }'
+        echo
+    done
+    echo "   ${DIM}说明: 仅列出 AFFECTED / REVIEW 的 CVE 命中的配置文件；配置为全局匹配，需人工确认是否处于同一 server/location 块${NC}"
 }
 
 emit_summary() {
@@ -594,6 +703,7 @@ emit_summary() {
     printf "   ${R}★ 受影响   : %d${NC}   ${Y}! 待复核   : %d${NC}   ${G}- 未暴露/安全: %d${NC}\n" \
         "$N_AFFECTED" "$N_REVIEW" "$(( N_NOEXPOSED + N_SAFE ))"
     printf "   涉及编号   : %s\n" "$RISK_LIST"
+    printf "   涉及文件   : %s 个（详见 [8] 有问题的配置文件）\n" "$PROBLEM_FILE_COUNT"
     if [ "$N_AFFECTED" -gt 0 ]; then
         printf "   总体判定   : ${R}${B}高危 - 存在可利用面, 建议立即升级${NC}\n"
     elif [ "$N_REVIEW" -gt 0 ]; then
@@ -663,6 +773,8 @@ emit_report() {
     else
         echo "   无"
     fi
+
+    echo; emit_problem_files
 
     echo; emit_summary
     echo "$SUB"
